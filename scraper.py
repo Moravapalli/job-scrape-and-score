@@ -1,62 +1,32 @@
-
 """
-Germany AI/Data Job Scraper — strict last-24-hours.
-
-Sources:
-  • LinkedIn   (via jobspy)        — native hours_old support
-  • Indeed     (via jobspy)        — native hours_old support
-  • Adzuna     (REST API + key)    — filtered by max_days_old + post-filter
-  • Remotive   (open API)          — post-filtered by publication_date
-  • Arbeitnow  (open API)          — post-filtered by created_at unix ts
-
-Strategy:
-  • LinkedIn + Indeed: sequential (they share a rate limiter)
-  • Adzuna + Remotive + Arbeitnow: parallel (independent APIs)
-  • 15s cooldown between search terms
-
-Setup:
-  1. pip install -r requirements.txt
-  2. Create .env file with:
-        ADZUNA_APP_ID=your_id
-        ADZUNA_APP_KEY=your_key
-  3. python scraper.py
-
-Output: jobs_today.csv
+Germany AI/Data Job Scraper — GitHub Actions optimized.
+Forces stdout flush so logs appear live, not buffered.
 """
+import sys
+# Force unbuffered output on GitHub Actions
+sys.stdout.reconfigure(line_buffering=True)
 
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
-import time
-import requests
-import pandas as pd
-import dateutil.parser
+import os, time, requests, pandas as pd, dateutil.parser
 from datetime import date, datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from jobspy import scrape_jobs
 
-
-# ── Config ────────────────────────────────────────────────────────────
-
-SEARCH_TERMS = [
-    "Data Scientist",
-    "AI Engineer",
-    "Data Engineer",
-]
-
-HOURS_WINDOW = 24    # change to 48 / 72 for wider window
-
+SEARCH_TERMS = ["Data Scientist", "AI Engineer", "Data Engineer"]
+HOURS_WINDOW = 24
 ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID",  "")
 ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
-
 CUTOFF = datetime.now(timezone.utc) - timedelta(hours=HOURS_WINDOW)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────
+def log(msg):
+    """Force flush so GitHub Actions shows it immediately."""
+    print(msg, flush=True)
 
-def is_recent(date_str: str) -> bool:
-    """True if date is within HOURS_WINDOW. Keep job if date is unparseable."""
+
+def is_recent(date_str):
     if not date_str:
         return True
     try:
@@ -68,21 +38,19 @@ def is_recent(date_str: str) -> bool:
         return True
 
 
-def is_recent_unix(ts: int) -> bool:
-    """True if Unix timestamp is within HOURS_WINDOW."""
+def is_recent_unix(ts):
     if not ts:
         return True
     try:
-        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        return dt >= CUTOFF
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc) >= CUTOFF
     except Exception:
         return True
 
 
-# ── Scrapers ──────────────────────────────────────────────────────────
+# ── Scrapers ─────────────────────────────────────────────────
 
-def scrape_jobspy_sites(term: str) -> pd.DataFrame:
-    """LinkedIn + Indeed via jobspy. Run together to respect their shared rate limiter."""
+def scrape_jobspy_sites(term):
+    t0 = time.time()
     try:
         df = scrape_jobs(
             site_name=["linkedin", "indeed"],
@@ -96,32 +64,34 @@ def scrape_jobspy_sites(term: str) -> pd.DataFrame:
         )
         if not df.empty and "site" in df.columns:
             for site, count in df["site"].value_counts().items():
-                print(f"  ✓ {site}: {count} jobs for '{term}'")
+                log(f"  ✓ {site}: {count} jobs for '{term}'  ({int(time.time()-t0)}s)")
         else:
-            print(f"  ✗ LinkedIn/Indeed: 0 jobs for '{term}'")
+            log(f"  ✗ LinkedIn/Indeed: 0 jobs for '{term}'")
         return df
     except Exception as e:
-        print(f"  ✗ LinkedIn/Indeed error for '{term}': {e}")
+        log(f"  ✗ LinkedIn/Indeed error: {e}")
         return pd.DataFrame()
 
 
-def scrape_adzuna(term: str) -> pd.DataFrame:
+def scrape_adzuna(term):
     if not (ADZUNA_APP_ID and ADZUNA_APP_KEY):
         return pd.DataFrame()
+    
+    # On GitHub Actions Adzuna often blocks. Fail fast.
+    t0 = time.time()
     rows = []
+    
     for page in range(1, 4):
         try:
             r = requests.get(
                 f"https://api.adzuna.com/v1/api/jobs/de/search/{page}",
                 params={
-                    "app_id":           ADZUNA_APP_ID,
-                    "app_key":          ADZUNA_APP_KEY,
-                    "what":             term,
-                    "results_per_page": 25,
-                    "max_days_old":     1,
-                    "sort_by":          "date",
+                    "app_id": ADZUNA_APP_ID, "app_key": ADZUNA_APP_KEY,
+                    "what": term, "results_per_page": 25,
+                    "max_days_old": 1, "sort_by": "date",
                 },
-                timeout=15,
+                timeout=8,                # short timeout
+                headers={"User-Agent": "Mozilla/5.0"},
             )
             for j in r.json().get("results", []):
                 if not is_recent(j.get("created", "")):
@@ -135,47 +105,24 @@ def scrape_adzuna(term: str) -> pd.DataFrame:
                     "date_posted": j.get("created", ""),
                     "site":        "adzuna",
                 })
+        except requests.exceptions.ConnectionError:
+            log(f"  ⚠ Adzuna unreachable (GitHub Actions network block) — skipping")
+            return pd.DataFrame()         # bail immediately, no retries
         except Exception as e:
-            print(f"  ✗ Adzuna error: {e}")
-    print(f"  ✓ Adzuna: {len(rows)} jobs for '{term}'")
+            log(f"  ✗ Adzuna error: {type(e).__name__}")
+            break
+    
+    log(f"  ✓ Adzuna: {len(rows)} jobs for '{term}'  ({int(time.time()-t0)}s)")
     return pd.DataFrame(rows)
 
 
-def scrape_remotive(term: str) -> pd.DataFrame:
-    try:
-        r = requests.get(
-            "https://remotive.com/api/remote-jobs",
-            params={"search": term, "limit": 50},
-            timeout=15,
-        )
-        rows = []
-        for j in r.json().get("jobs", []):
-            if not is_recent(j.get("publication_date", "")):
-                continue
-            loc = j.get("candidate_required_location", "") or ""
-            if any(x in loc for x in ["Germany", "Europe", "Worldwide", ""]):
-                rows.append({
-                    "title":       j.get("title", ""),
-                    "company":     j.get("company_name", ""),
-                    "location":    loc or "Remote",
-                    "job_url":     j.get("url", ""),
-                    "description": (j.get("description", "") or "")[:1500],
-                    "date_posted": j.get("publication_date", ""),
-                    "site":        "remotive",
-                })
-        print(f"  ✓ Remotive: {len(rows)} jobs for '{term}'")
-        return pd.DataFrame(rows)
-    except Exception as e:
-        print(f"  ✗ Remotive error: {e}")
-        return pd.DataFrame()
-
-
-def scrape_arbeitnow(term: str) -> pd.DataFrame:
+def scrape_arbeitnow(term):
+    t0 = time.time()
     try:
         r = requests.get(
             "https://www.arbeitnow.com/api/job-board-api",
             params={"search": term},
-            timeout=15,
+            timeout=10,
         )
         rows = []
         for j in r.json().get("data", []):
@@ -190,83 +137,59 @@ def scrape_arbeitnow(term: str) -> pd.DataFrame:
                 "date_posted": str(j.get("created_at", "")),
                 "site":        "arbeitnow",
             })
-        print(f"  ✓ Arbeitnow: {len(rows)} jobs for '{term}'")
+        log(f"  ✓ Arbeitnow: {len(rows)} jobs for '{term}'  ({int(time.time()-t0)}s)")
         return pd.DataFrame(rows)
     except Exception as e:
-        print(f"  ✗ Arbeitnow error: {e}")
+        log(f"  ✗ Arbeitnow error: {e}")
         return pd.DataFrame()
 
 
-# ── Pipeline ──────────────────────────────────────────────────────────
+# ── Pipeline ─────────────────────────────────────────────────
 
-def process_term(term: str) -> list:
-    """For each term:
-       1. LinkedIn + Indeed sequentially (shared rate limiter)
-       2. Adzuna + Remotive + Arbeitnow in parallel (independent APIs)
-    """
-    print(f"\n[Scraping: '{term}']")
-    results = []
-
-    # Step 1: LinkedIn + Indeed
-    results.append(scrape_jobspy_sites(term))
-
-    # Step 2: independent APIs in parallel
-    independent = [scrape_adzuna, scrape_remotive, scrape_arbeitnow]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(api, term): api.__name__ for api in independent}
+def process_term(term):
+    log(f"\n[Scraping: '{term}']")
+    results = [scrape_jobspy_sites(term)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(api, term) for api in [scrape_adzuna, scrape_arbeitnow]]
         for fut in as_completed(futures):
             results.append(fut.result())
-
     return results
 
 
-def main() -> None:
+def main():
     start = time.time()
-
-    print(f"⏱ Cutoff: jobs posted after {CUTOFF.strftime('%Y-%m-%d %H:%M UTC')} ({HOURS_WINDOW}h window)")
-    if not (ADZUNA_APP_ID and ADZUNA_APP_KEY):
-        print("⚠ Adzuna keys not set in .env — skipping Adzuna")
+    log(f"⏱ Cutoff: {CUTOFF.strftime('%Y-%m-%d %H:%M UTC')} ({HOURS_WINDOW}h window)")
+    log(f"⏱ Adzuna keys: {'✓ set' if (ADZUNA_APP_ID and ADZUNA_APP_KEY) else '✗ missing'}")
 
     all_jobs = []
-
     for i, term in enumerate(SEARCH_TERMS):
         all_jobs.extend(process_term(term))
         if i < len(SEARCH_TERMS) - 1:
-            print("  ⏳ Cooling down 15s before next term...")
-            time.sleep(15)
+            log("  ⏳ Cooling down 10s before next term...")
+            time.sleep(10)   # reduced from 15s
 
-    # Combine
     combined = pd.concat(all_jobs, ignore_index=True)
-
-    # Drop empty titles
     combined = combined[combined["title"].notna() & (combined["title"] != "")]
-
-    # Deduplicate by (title, company) — fall back to title alone if no company
     combined["company"] = combined["company"].fillna("").astype(str)
     combined.drop_duplicates(subset=["title", "company"], keep="first", inplace=True)
-
-    # Also dedupe by URL (safety net for cross-source duplicates)
     if "job_url" in combined.columns:
         combined = combined[combined["job_url"].notna() & (combined["job_url"] != "")]
         combined.drop_duplicates(subset=["job_url"], keep="first", inplace=True)
-
     combined["scraped_date"] = str(date.today())
 
-    out_path = "jobs_today.csv"
-    combined.to_csv(out_path, index=False)
+    os.makedirs("output", exist_ok=True)
+    combined.to_csv("output/jobs_today.csv", index=False)
 
     elapsed = int(time.time() - start)
-    print(f"\n{'─' * 50}")
-    print(f"✓ {len(combined)} unique jobs saved → {out_path}  ({elapsed}s)")
-
+    log(f"\n{'─'*50}")
+    log(f"✓ {len(combined)} unique jobs saved → output/jobs_today.csv  ({elapsed}s)")
     if "site" in combined.columns and not combined.empty:
-        print("\nBreakdown by site:")
-        print(combined.groupby("site")["title"].count().sort_values(ascending=False).to_string())
+        log("\nBreakdown by site:")
+        log(combined.groupby("site")["title"].count().sort_values(ascending=False).to_string())
 
 
 if __name__ == "__main__":
     main()
-
 
 
 
