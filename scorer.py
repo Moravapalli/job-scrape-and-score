@@ -10,8 +10,24 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL     = "llama-3.1-8b-instant"
 MIN_SCORE = 7
 
-with open("my_resume.txt") as f:
-    MY_RESUME = f.read()
+# ── Load resume — env var (CI/GitHub Actions) or file (local) ─────────
+MY_RESUME = os.environ.get("MY_RESUME", "").strip()
+
+if MY_RESUME:
+    print(f"✓ Resume loaded from MY_RESUME env var ({len(MY_RESUME)} chars)")
+elif os.path.exists("my_resume.txt"):
+    with open("my_resume.txt", encoding="utf-8") as f:
+        MY_RESUME = f.read().strip()
+    print(f"✓ Resume loaded from my_resume.txt ({len(MY_RESUME)} chars)")
+else:
+    print("✗ Resume not found.")
+    print("  → Local:           create my_resume.txt with your resume text")
+    print("  → GitHub Actions:  add MY_RESUME repository secret")
+    exit(1)
+
+if "[PASTE YOUR" in MY_RESUME or len(MY_RESUME) < 100:
+    print("✗ Resume looks like placeholder text or is too short — paste your real resume")
+    exit(1)
 
 # ── Scoring prompt ────────────────────────────────────────────────────
 SYSTEM  = """You are an expert technical recruiter and career coach.

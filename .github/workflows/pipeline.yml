@@ -38,6 +38,7 @@ jobs:
         run: python scorer.py
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MY_RESUME:    ${{ secrets.MY_RESUME }}
 
       - name: Stage 3 — Push to Google Sheets
         if: success()
