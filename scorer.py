@@ -1,36 +1,67 @@
-# scorer.py — production-ready AI job scorer
+"""
+Stage 2 — Score each job against the candidate's resume using Groq.
+
+Features:
+  • Loads resume from env var (CI) or file (local)
+  • Truncates resume + JD to fit Groq's 6k TPM free-tier limit
+  • Handles 429 rate limits with smart back-off (parses retry-after)
+  • Optional keyword pre-filter to skip obviously irrelevant jobs
+  • Saves all scored jobs + shortlist to output/
+"""
+
 from dotenv import load_dotenv
-import os, json, time, pandas as pd
-from groq import Groq
 load_dotenv()
 
+import os, json, time, re, pandas as pd
+from groq import Groq
+
+# ── Config ────────────────────────────────────────────────────────────
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-MODEL     = "llama-3.1-8b-instant"
-MIN_SCORE = 7
+MODEL              = "llama-3.1-8b-instant"
+MIN_SCORE          = 7
+RESUME_MAX_CHARS   = 2000      # truncate resume to control token usage
+JD_MAX_CHARS       = 800       # truncate job description
+SLEEP_BETWEEN_CALLS = 2        # seconds — stays under 6k TPM
+ENABLE_PREFILTER   = True      # quick keyword check before API call
 
-# ── Load resume — env var (CI/GitHub Actions) or file (local) ─────────
+# Skills that indicate a relevant role — customize to your stack
+SKILL_KEYWORDS = [
+    "python", "sql", "aws", "azure", "gcp", "docker", "kubernetes",
+    "machine learning", "ml", "ai", "artificial intelligence",
+    "data engineer", "data scientist", "ai engineer", "ml engineer",
+    "etl", "spark", "kafka", "airflow", "snowflake", "databricks",
+    "tensorflow", "pytorch", "llm", "nlp", "computer vision",
+    "analytics", "data pipeline", "mlops",
+]
+
+# ── Load resume — env var (CI) or file (local) ────────────────────────
 MY_RESUME = os.environ.get("MY_RESUME", "").strip()
 
 if MY_RESUME:
-    print(f"✓ Resume loaded from MY_RESUME env var ({len(MY_RESUME)} chars)")
+    print(f"✓ Resume loaded from MY_RESUME env var ({len(MY_RESUME)} chars)", flush=True)
 elif os.path.exists("my_resume.txt"):
     with open("my_resume.txt", encoding="utf-8") as f:
         MY_RESUME = f.read().strip()
-    print(f"✓ Resume loaded from my_resume.txt ({len(MY_RESUME)} chars)")
+    print(f"✓ Resume loaded from my_resume.txt ({len(MY_RESUME)} chars)", flush=True)
 else:
     print("✗ Resume not found.")
-    print("  → Local:           create my_resume.txt with your resume text")
+    print("  → Local:           create my_resume.txt with your resume")
     print("  → GitHub Actions:  add MY_RESUME repository secret")
     exit(1)
 
 if "[PASTE YOUR" in MY_RESUME or len(MY_RESUME) < 100:
-    print("✗ Resume looks like placeholder text or is too short — paste your real resume")
+    print("✗ Resume looks like placeholder or too short — paste your real resume")
     exit(1)
 
+# Truncate to fit rate limit
+if len(MY_RESUME) > RESUME_MAX_CHARS:
+    MY_RESUME = MY_RESUME[:RESUME_MAX_CHARS] + "\n[...truncated for scoring efficiency]"
+    print(f"  → Truncated resume to {RESUME_MAX_CHARS} chars to fit rate limit", flush=True)
+
 # ── Scoring prompt ────────────────────────────────────────────────────
-SYSTEM  = """You are an expert technical recruiter and career coach.
-You evaluate job listings against a candidate's resume with precision and honesty. 
+SYSTEM = """You are an expert technical recruiter and career coach.
+You evaluate job listings against a candidate's resume with precision and honesty.
 The resume and job description may be in English or German.
 Understand both languages and map equivalent skills across languages.
 You always respond with valid JSON only — no preamble, no markdown, no explanation outside the JSON."""
@@ -45,14 +76,14 @@ JOB LISTING:
 Title:       {row.get('title', 'N/A')}
 Company:     {row.get('company', 'N/A')}
 Location:    {row.get('location', 'N/A')}
-Description: {str(row.get('description', ''))[:2000]}
+Description: {str(row.get('description', ''))[:JD_MAX_CHARS]}
 
 SCORING CRITERIA:
-- Skills match (40%): Do their tech stack and tools match the JD keywords?
-- Seniority match (20%): Is the level appropriate for their experience?
-- Domain match (20%): Is the industry/domain relevant to their background?
-- Location/remote (10%): Does the location work for the candidate?
-- Growth potential (10%): Does this role offer career progression?
+- Skills match (40%): Tech stack alignment with JD keywords
+- Seniority match (20%): Level appropriate for their experience?
+- Domain match (20%): Industry relevant to background?
+- Location/remote (10%): Does location work?
+- Growth potential (10%): Career progression?
 
 Return ONLY this JSON — nothing else:
 {{
@@ -65,8 +96,8 @@ Return ONLY this JSON — nothing else:
   "apply": <true if score >= 7, else false>
 }}"""
 
-# ── Scorer with retry + error handling ───────────────────────────────
-def score_job(row, retries=3):
+# ── Scorer with smart 429 handling ────────────────────────────────────
+def score_job(row, retries=4):
     for attempt in range(retries):
         try:
             response = client.chat.completions.create(
@@ -76,7 +107,7 @@ def score_job(row, retries=3):
                     {"role": "user",   "content": build_prompt(row)},
                 ],
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=250,
             )
             raw = response.choices[0].message.content.strip()
 
@@ -105,24 +136,64 @@ def score_job(row, retries=3):
         except json.JSONDecodeError:
             print(f"  ✗ Bad JSON (attempt {attempt+1}) — retrying...", flush=True)
             time.sleep(2)
-        except Exception as e:
-            print(f"  ✗ Error: {e}", flush=True)
-            time.sleep(5)
 
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "rate_limit" in error_msg.lower():
+                match = re.search(r"try again in ([\d.]+)s", error_msg)
+                wait  = float(match.group(1)) + 2 if match else 25
+                print(f"  ⏳ Rate limited — waiting {wait:.0f}s...", flush=True)
+                time.sleep(wait)
+            else:
+                print(f"  ✗ Error: {error_msg[:120]}", flush=True)
+                time.sleep(5)
+
+    return _empty_score()
+
+
+def _empty_score():
     return {
         "score": 0, "skills_match": 0, "seniority_match": 0,
         "highlights": "", "concerns": "scoring failed",
-        "reason": "error", "apply": False,
+        "reason": "Could not score this listing", "apply": False,
     }
 
-# ── Main ──────────────────────────────────────────────────────────────
-INPUT_CSV  = "output/jobs_today.csv" if os.path.exists("output/jobs_today.csv") else "jobs_today.csv"
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-jobs  = pd.read_csv(INPUT_CSV)
-jobs  = jobs[jobs["title"].notna()].reset_index(drop=True)
+def quick_filter(row):
+    """Cheap keyword check — skips obviously irrelevant jobs without API call."""
+    text = (str(row.get("title", "")) + " " + str(row.get("description", ""))).lower()
+    return any(kw in text for kw in SKILL_KEYWORDS)
+
+
+# ── Main ──────────────────────────────────────────────────────────────
+os.makedirs("output", exist_ok=True)
+
+# Auto-detect CSV location
+if os.path.exists("output/jobs_today.csv"):
+    INPUT_CSV = "output/jobs_today.csv"
+elif os.path.exists("jobs_today.csv"):
+    INPUT_CSV = "jobs_today.csv"
+else:
+    print("✗ jobs_today.csv not found. Run scraper.py first.")
+    exit(1)
+
+print(f"✓ Reading {INPUT_CSV}", flush=True)
+jobs = pd.read_csv(INPUT_CSV)
+jobs = jobs[jobs["title"].notna()].reset_index(drop=True)
+total_raw = len(jobs)
+print(f"  → {total_raw} jobs in CSV", flush=True)
+
+# Pre-filter
+if ENABLE_PREFILTER:
+    jobs = jobs[jobs.apply(quick_filter, axis=1)].reset_index(drop=True)
+    skipped = total_raw - len(jobs)
+    print(f"  → Skipped {skipped} obviously irrelevant jobs ({len(jobs)} to score)\n", flush=True)
+
 total = len(jobs)
+if total == 0:
+    print("✗ No jobs to score after filtering")
+    exit(0)
+
 print(f"Scoring {total} jobs with Groq ({MODEL})...\n", flush=True)
 
 results    = []
@@ -136,28 +207,35 @@ for i, row in jobs.iterrows():
     result = score_job(row)
     results.append(result)
     print(f"score: {result['score']}/10", flush=True)
-    time.sleep(0.3)
+    time.sleep(SLEEP_BETWEEN_CALLS)
 
+# Combine & save
 scored    = pd.concat([jobs, pd.DataFrame(results)], axis=1)
 shortlist = scored[scored["score"] >= MIN_SCORE].sort_values("score", ascending=False)
 
-scored.to_csv(f"{OUTPUT_DIR}/jobs_scored.csv", index=False)
-shortlist.to_csv(f"{OUTPUT_DIR}/shortlist.csv", index=False)
+scored.to_csv("output/jobs_scored.csv", index=False)
+shortlist.to_csv("output/shortlist.csv", index=False)
 
 elapsed = int(time.time() - start_time)
+mins    = elapsed // 60
+secs    = elapsed % 60
 print(f"""
 ╔══════════════════════════════════╗
-  Groq scoring complete ({elapsed}s)
-  Model:        {MODEL}
-  Total scored: {total}
-  Shortlisted:  {len(shortlist)}  (score >= {MIN_SCORE})
-  Cost:         $0.00
+  Groq scoring complete ({mins}m {secs}s)
+  Model:          {MODEL}
+  Pre-filtered:   {total_raw} → {total}
+  Shortlisted:    {len(shortlist)}  (score >= {MIN_SCORE})
+  Cost:           $0.00
 ╚══════════════════════════════════╝
 """, flush=True)
 
-cols      = ["title", "company", "location", "score", "reason", "job_url"]
-available = [c for c in cols if c in shortlist.columns]
-print(shortlist[available].head(10).to_string(index=False))
+if not shortlist.empty:
+    cols      = ["title", "company", "location", "score", "reason", "job_url"]
+    available = [c for c in cols if c in shortlist.columns]
+    print("Top 10 matches:\n")
+    print(shortlist[available].head(10).to_string(index=False))
+else:
+    print("No jobs scored above the threshold today.")
 
 
 
