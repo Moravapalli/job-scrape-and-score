@@ -1,9 +1,10 @@
+# Daily Job Search Pipeline — runs 04:00 UTC and 09:20 UTC
 name: Daily Job Search Pipeline
 
 on:
   schedule:
     - cron: '0 4 * * 1-5'
-    - cron: '20 9 * * *' 
+    - cron: '40 9 * * *' 
   workflow_dispatch:           # allow manual run
 
 jobs:
