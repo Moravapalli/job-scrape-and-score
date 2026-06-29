@@ -21,8 +21,8 @@ Scrapes jobs daily, scores them against your resume with AI, pushes matches to G
 ### 2. Clone and install
 
 ```bash
-git clone https://github.com/Moravapalli/job-automation.git
-cd job-automation
+git clone https://github.com/Moravapalli/job-scrape-and-score.git
+cd job-scrape-and-score
 pip install -r requirements.txt
 ```
 
