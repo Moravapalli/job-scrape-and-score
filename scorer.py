@@ -20,8 +20,8 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 MODEL              = "llama-3.1-8b-instant"
 MIN_SCORE          = 7
-RESUME_MAX_CHARS   = 2000      # truncate resume to control token usage
-JD_MAX_CHARS       = 800       # truncate job description
+RESUME_MAX_CHARS   = 1500      # truncate resume to control token usage
+JD_MAX_CHARS       = 600       # truncate job description
 SLEEP_BETWEEN_CALLS = 2        # seconds — stays under 6k TPM
 ENABLE_PREFILTER   = True      # quick keyword check before API call
 
