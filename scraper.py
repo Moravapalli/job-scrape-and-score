@@ -14,7 +14,29 @@ from datetime import date, datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from jobspy import scrape_jobs
 
-SEARCH_TERMS = ["Data Scientist", "AI Engineer", "Data Engineer"]
+SEARCH_TERMS = [
+    # Core AI/ML — these already match LLM, GenAI, ML, DL variants
+    "AI Engineer",
+    "Machine Learning Engineer",
+    "MLOps Engineer",
+    "LLM Engineer",
+    "Generative AI Engineer",
+    
+    # Data science + adjacent
+    "Data Scientist",
+    "Applied Scientist",
+    
+    # NLP / Vision (still very common titles)
+    "NLP Engineer",
+    "Computer Vision Engineer",
+    
+    # Data engineering (still under your AI focus)
+    "Data Engineer",
+    "Analytics Engineer",
+    
+    # Agentic / newest
+    "AI Agent Engineer",
+]
 HOURS_WINDOW = 24
 ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID",  "")
 ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")

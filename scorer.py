@@ -20,8 +20,8 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 MODEL              = "llama-3.1-8b-instant"
 MIN_SCORE          = 7
-RESUME_MAX_CHARS   = 1500      # truncate resume to control token usage
-JD_MAX_CHARS       = 600       # truncate job description
+RESUME_MAX_CHARS   = 2000      # truncate resume to control token usage
+JD_MAX_CHARS       = 800       # truncate job description
 SLEEP_BETWEEN_CALLS = 2        # seconds — stays under 6k TPM
 ENABLE_PREFILTER   = True      # quick keyword check before API call
 
@@ -60,11 +60,54 @@ if len(MY_RESUME) > RESUME_MAX_CHARS:
     print(f"  → Truncated resume to {RESUME_MAX_CHARS} chars to fit rate limit", flush=True)
 
 # ── Scoring prompt ────────────────────────────────────────────────────
+# SYSTEM = """You are an expert technical recruiter and career coach.
+# You evaluate job listings against a candidate's resume with precision and honesty.
+# The resume and job description may be in English or German.
+# Understand both languages and map equivalent skills across languages.
+# You always respond with valid JSON only — no preamble, no markdown, no explanation outside the JSON."""
+
 SYSTEM = """You are an expert technical recruiter and career coach.
 You evaluate job listings against a candidate's resume with precision and honesty.
-The resume and job description may be in English or German.
-Understand both languages and map equivalent skills across languages.
-You always respond with valid JSON only — no preamble, no markdown, no explanation outside the JSON."""
+Job descriptions may be in English or German — read both accurately.
+
+CANDIDATE LANGUAGE PROFILE:
+- English: native/fluent (any role in English is a perfect fit linguistically)
+- German: B1 level (conversational — can handle everyday German, cannot do
+  business negotiations, complex written docs, or client-facing German communication)
+
+LANGUAGE FIT RULES (apply BEFORE other scoring criteria):
+
+HARD REJECTIONS (score capped at 3 regardless of skills match):
+- "C2 German required", "muttersprachlich", "native German speaker only"
+- "Verhandlungssicher Deutsch" (business-fluent German required)
+- Role explicitly states English is not sufficient
+- Client-facing role in Germany requiring fluent German communication
+  (sales, customer success, legal, HR, consulting)
+
+MODERATE PENALTIES (subtract from base score):
+- "C1 German required" or "sehr gute Deutschkenntnisse erforderlich": -3
+- "Good German" without specified level, but clearly required: -2
+- Fully German JD with no English signals AND heavy communication role: -2
+- Fully German JD but technical role (mostly code, minimal talking): -1
+
+NO PENALTY (score normally):
+- "English is our working language" / "We speak English"
+- "German is a plus" / "Nice to have: German" / "German optional"
+- "B1/B2 German sufficient" or "basic German"
+- English JD with any level of German mentioned as bonus
+- Remote roles at international companies
+- Roles where language isn't mentioned at all (assume English-friendly)
+
+DECISION HEURISTICS:
+- When language requirement is ambiguous, check the JD language itself:
+  English JD → likely English-friendly team → no penalty
+  German JD → likely German-speaking team → apply -1 minimum
+- Technical depth beats language for engineering roles
+  (a strong ML/AI role in German is still worth applying if English JD exists)
+- Job title in English + description in German usually means: 
+  international company, English-friendly, German preferred
+
+You ALWAYS respond with valid JSON only — no markdown, no preamble, no text outside the JSON."""
 
 def build_prompt(row):
     return f"""Score this job listing for the candidate below. Be honest — a bad match should score 2-3, not 5-6.
