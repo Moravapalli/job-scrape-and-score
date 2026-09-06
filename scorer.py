@@ -18,21 +18,34 @@ from groq import Groq
 # ── Config ────────────────────────────────────────────────────────────
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-MODEL              = "llama-3.1-8b-instant"
+MODEL              = "openai/gpt-oss-20b"
 MIN_SCORE          = 7
 RESUME_MAX_CHARS   = 2000      # truncate resume to control token usage
 JD_MAX_CHARS       = 800       # truncate job description
 SLEEP_BETWEEN_CALLS = 2        # seconds — stays under 6k TPM
 ENABLE_PREFILTER   = True      # quick keyword check before API call
 
-# Skills that indicate a relevant role — customize to your stack
-SKILL_KEYWORDS = [
-    "python", "sql", "aws", "azure", "gcp", "docker", "kubernetes",
-    "machine learning", "ml", "ai", "artificial intelligence",
-    "data engineer", "data scientist", "ai engineer", "ml engineer",
-    "etl", "spark", "kafka", "airflow", "snowflake", "databricks",
-    "tensorflow", "pytorch", "llm", "nlp", "computer vision",
-    "analytics", "data pipeline", "mlops",
+# Title-only pre-filter (not description — descriptions are full of generic
+# "AI-powered" marketing boilerplate that let irrelevant roles like sales/BD
+# jobs slip through when matched against description text). A job must match
+# an include term and no exclude term to reach the LLM. Customize to your
+# target roles/resume.
+TITLE_INCLUDE_KEYWORDS = [
+    "ai", "artificial intelligence", "machine learning", "ml engineer",
+    "deep learning", "computer vision", "cv engineer", "mlops",
+    "data scientist", "data engineer", "nlp", "llm", "generative ai",
+    "perception", "robotics", "autonomous", "embedded vision",
+    "applied scientist", "research scientist", "vision engineer",
+]
+
+TITLE_EXCLUDE_KEYWORDS = [
+    "sales", "account executive", "account manager", "business development",
+    "marketing", "recruiter", "talent acquisition", "human resources",
+    "finance manager", "accountant", "bookkeeper", "legal counsel",
+    "procurement", "warehouse", "logistics", "customer success",
+    "community manager", "social media", "content creator", "copywriter",
+    "video editor", "chief of staff", "general manager", "operations manager",
+    "presenter", "host", "onboarding manager", "billing manager",
 ]
 
 # ── Load resume — env var (CI) or file (local) ────────────────────────
@@ -60,54 +73,22 @@ if len(MY_RESUME) > RESUME_MAX_CHARS:
     print(f"  → Truncated resume to {RESUME_MAX_CHARS} chars to fit rate limit", flush=True)
 
 # ── Scoring prompt ────────────────────────────────────────────────────
-# SYSTEM = """You are an expert technical recruiter and career coach.
-# You evaluate job listings against a candidate's resume with precision and honesty.
-# The resume and job description may be in English or German.
-# Understand both languages and map equivalent skills across languages.
-# You always respond with valid JSON only — no preamble, no markdown, no explanation outside the JSON."""
+# Kept intentionally short: this is sent on every single scoring call, so its
+# token cost multiplies by job count against Groq's 200K-tokens/day free-tier
+# cap. See LANGUAGE_RULES below for the full logic this compresses.
+SYSTEM = """Expert technical recruiter. Score job listings vs. a resume, honestly \
+(bad match = 2-3, not 5-6). JD may be English or German.
 
-SYSTEM = """You are an expert technical recruiter and career coach.
-You evaluate job listings against a candidate's resume with precision and honesty.
-Job descriptions may be in English or German — read both accurately.
+Candidate: English native/fluent. German B1 (conversational, not business-fluent).
+Language rules — apply first:
+- Cap score at 3 if: native/muttersprachlich German, C2 German, verhandlungssicher \
+Deutsch, or a client-facing role (sales/support/HR/legal) needs fluent German.
+- -3 if C1 German required. -2 if German clearly required (level unspecified) or \
+fully-German JD + heavy communication role. -1 if fully-German JD but mostly technical.
+- No penalty if: English is the working language, German is optional/a plus, \
+B1/B2 is enough, remote/international team, or language isn't mentioned.
 
-CANDIDATE LANGUAGE PROFILE:
-- English: native/fluent (any role in English is a perfect fit linguistically)
-- German: B1 level (conversational — can handle everyday German, cannot do
-  business negotiations, complex written docs, or client-facing German communication)
-
-LANGUAGE FIT RULES (apply BEFORE other scoring criteria):
-
-HARD REJECTIONS (score capped at 3 regardless of skills match):
-- "C2 German required", "muttersprachlich", "native German speaker only"
-- "Verhandlungssicher Deutsch" (business-fluent German required)
-- Role explicitly states English is not sufficient
-- Client-facing role in Germany requiring fluent German communication
-  (sales, customer success, legal, HR, consulting)
-
-MODERATE PENALTIES (subtract from base score):
-- "C1 German required" or "sehr gute Deutschkenntnisse erforderlich": -3
-- "Good German" without specified level, but clearly required: -2
-- Fully German JD with no English signals AND heavy communication role: -2
-- Fully German JD but technical role (mostly code, minimal talking): -1
-
-NO PENALTY (score normally):
-- "English is our working language" / "We speak English"
-- "German is a plus" / "Nice to have: German" / "German optional"
-- "B1/B2 German sufficient" or "basic German"
-- English JD with any level of German mentioned as bonus
-- Remote roles at international companies
-- Roles where language isn't mentioned at all (assume English-friendly)
-
-DECISION HEURISTICS:
-- When language requirement is ambiguous, check the JD language itself:
-  English JD → likely English-friendly team → no penalty
-  German JD → likely German-speaking team → apply -1 minimum
-- Technical depth beats language for engineering roles
-  (a strong ML/AI role in German is still worth applying if English JD exists)
-- Job title in English + description in German usually means: 
-  international company, English-friendly, German preferred
-
-You ALWAYS respond with valid JSON only — no markdown, no preamble, no text outside the JSON."""
+Respond with valid JSON only — no markdown, no text outside the JSON."""
 
 def build_prompt(row):
     return f"""Score this job listing for the candidate below. Be honest — a bad match should score 2-3, not 5-6.
@@ -150,7 +131,8 @@ def score_job(row, retries=4):
                     {"role": "user",   "content": build_prompt(row)},
                 ],
                 temperature=0.1,
-                max_tokens=250,
+                max_tokens=600,
+                reasoning_effort="low",
             )
             raw = response.choices[0].message.content.strip()
 
@@ -203,9 +185,13 @@ def _empty_score():
 
 
 def quick_filter(row):
-    """Cheap keyword check — skips obviously irrelevant jobs without API call."""
-    text = (str(row.get("title", "")) + " " + str(row.get("description", ""))).lower()
-    return any(kw in text for kw in SKILL_KEYWORDS)
+    """Title-only keyword check — skips irrelevant jobs without an API call.
+    Title-only (not description) to avoid buzzword false-positives; must hit
+    an include term and no exclude term."""
+    title = str(row.get("title", "")).lower()
+    if any(kw in title for kw in TITLE_EXCLUDE_KEYWORDS):
+        return False
+    return any(kw in title for kw in TITLE_INCLUDE_KEYWORDS)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
