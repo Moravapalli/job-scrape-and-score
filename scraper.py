@@ -9,43 +9,129 @@ sys.stdout.reconfigure(line_buffering=True)
 from dotenv import load_dotenv
 load_dotenv()
 
-import os, time, requests, pandas as pd, dateutil.parser
+import os, re, time, requests, pandas as pd, dateutil.parser
 from datetime import date, datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from jobspy import scrape_jobs
 
 SEARCH_TERMS = [
-    # Core AI/ML — these already match LLM, GenAI, ML, DL variants
+    # Core AI/ML
     "AI Engineer",
+    "Senior AI Engineer",
+    "AI Software Engineer",
+    "Senior AI Software Engineer",
     "Machine Learning Engineer",
-    "MLOps Engineer",
-    "LLM Engineer",
-    "Generative AI Engineer",
-    
-    # Data science + adjacent
-    "Data Scientist",
-    "Applied Scientist",
-    
-    # NLP / Vision (still very common titles)
-    "NLP Engineer",
+    "Senior Machine Learning Engineer",
+    "Deep Learning Engineer",
+    "Senior Deep Learning Engineer",
+
+    # Computer Vision / Perception
     "Computer Vision Engineer",
-    
-    # Data engineering (still under your AI focus)
-    "Data Engineer",
-    "Analytics Engineer",
-    
-    # Agentic / newest
-    "AI Agent Engineer",
+    "Senior Computer Vision Engineer",
+    "Computer Vision Software Engineer",
+    "Computer Vision / Deep Learning Engineer",
+    "Machine Learning Engineer - Computer Vision",
+    "AI Engineer - Computer Vision",
+    "Perception Engineer",
+    "Senior Perception Engineer",
+    "AI Perception Engineer",
+    "Computer Vision Research Engineer",
+    "Machine Vision Engineer",
+    "Machine Vision Software Engineer",
+
+    # Edge AI / Embedded AI
+    "Edge AI Engineer",
+    "Edge ML Engineer",
+    "Embedded AI Engineer",
+    "Embedded Machine Learning Engineer",
+    "Embedded Vision Engineer",
+    "Embedded Computer Vision Engineer",
+    "AI Engineer - Edge AI",
+    "AI Software Engineer - Edge AI",
+    "Machine Learning Engineer - Edge AI",
+    "AI Inference Engineer",
+
+    # AI / ML Optimization & Performance
+    "AI Performance Engineer",
+    "ML Performance Engineer",
+    "Deep Learning Optimization Engineer",
+    "Machine Learning Optimization Engineer",
+    "Model Optimization Engineer",
+    "AI Inference Optimization Engineer",
+    "Machine Learning Systems Engineer",
+    "ML Systems Engineer",
+
+    # MLOps / ML Infrastructure
+    "MLOps Engineer",
+    "ML Platform Engineer",
+    "ML Infrastructure Engineer",
+    "Machine Learning Infrastructure Engineer",
+
+    # Robotics / Autonomous Systems
+    "Robotics Perception Engineer",
+    "Robot Vision Engineer",
+    "Robotics AI Engineer",
+    "Autonomous Systems Engineer",
+    "Autonomous Driving Engineer",
+    "Autonomous Driving Perception Engineer",
+
+
+    # Data Science / Applied Research
+    "Data Scientist",
+    "Senior Data Scientist",
+    "Applied Scientist",
+    "Applied Scientist - Computer Vision",
+    "Machine Learning Research Engineer",
 ]
+
 HOURS_WINDOW = 24
 ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID",  "")
 ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+JOOBLE_API_KEY = os.environ.get("JOOBLE_API_KEY", "")
 CUTOFF = datetime.now(timezone.utc) - timedelta(hours=HOURS_WINDOW)
+
+# Jooble's free tier is a 500-request LIFETIME cap (not monthly, not daily) —
+# so it only runs against a handful of broad terms instead of the full
+# SEARCH_TERMS list, to keep the key usable for months rather than days.
+JOOBLE_SEARCH_TERMS = [
+    "AI Engineer",
+    "Machine Learning Engineer",
+    "Computer Vision Engineer",
+    "Data Scientist",
+    "MLOps Engineer",
+]
 
 
 def log(msg):
     """Force flush so GitHub Actions shows it immediately."""
     print(msg, flush=True)
+
+
+# ── Cross-source dedup ──────────────────────────────────────────────────
+# The same real-world posting shows up under different job_urls per source
+# (LinkedIn's own URL vs. a mirrored listing on Arbeitnow/Adzuna/Jooble/etc),
+# so a job_url-only dedup misses it. Title+company dedup catches these, but
+# only if the strings match exactly — a "(m/f/d)" suffix on one source, a
+# "GmbH" suffix on another, or different casing was enough to slip through.
+# Normalizing both before comparing catches those cross-source duplicates.
+_GENDER_SUFFIX_RE = re.compile(r"\((?:all genders?|[mwfdx]\s*/\s*){1,4}[mwfdx]?\)")
+_PUNCT_RE         = re.compile(r"[^\w\s]")
+_WHITESPACE_RE    = re.compile(r"\s+")
+_COMPANY_SUFFIX_RE = re.compile(
+    r"\b(gmbh|ag|se|kgaa|kg|inc|ltd|llc|corp|corporation|plc|oy|bv|nv|sa|srl|pvt)\b"
+)
+
+
+def normalize_key(text):
+    text = str(text or "").lower()
+    text = _GENDER_SUFFIX_RE.sub(" ", text)
+    text = _PUNCT_RE.sub(" ", text)
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def normalize_company(text):
+    text = _COMPANY_SUFFIX_RE.sub(" ", normalize_key(text))
+    return _WHITESPACE_RE.sub(" ", text).strip()
 
 
 def is_recent(date_str):
@@ -166,13 +252,101 @@ def scrape_arbeitnow(term):
         return pd.DataFrame()
 
 
+def scrape_arbeitsagentur(term):
+    """Bundesagentur für Arbeit — official, free, unlimited public API.
+    No key required. https://github.com/bundesAPI/jobsuche-api"""
+    t0 = time.time()
+    try:
+        r = requests.get(
+            "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v6/jobs",
+            params={
+                "was":                 term,
+                "wo":                  "Deutschland",
+                "size":                50,
+                "veroeffentlichtseit": max(1, HOURS_WINDOW // 24),  # days, 0-100
+                "angebotsart":         1,   # 1 = regular employment
+            },
+            headers={"X-API-Key": "jobboerse-jobsuche", "Accept": "application/json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log(f"  ✗ Arbeitsagentur HTTP {r.status_code} for '{term}'")
+            return pd.DataFrame()
+
+        rows = []
+        for j in r.json().get("ergebnisliste", []):
+            refnr = j.get("referenznummer", "")
+            job_url = j.get("externeURL") or (
+                f"https://www.arbeitsagentur.de/jobsuche/jobdetail/{refnr}" if refnr else ""
+            )
+            locations = j.get("stellenlokationen") or []
+            ort = (locations[0].get("adresse") or {}).get("ort", "Germany") if locations else "Germany"
+            rows.append({
+                "title":       j.get("stellenangebotsTitel", ""),
+                "company":     j.get("firma", ""),
+                "location":    ort,
+                "job_url":     job_url,
+                # The search endpoint doesn't return a full description —
+                # only /pc/v4/jobdetails/{refnr} does, which would mean one
+                # extra request per listing. Left blank; title still feeds
+                # the scorer's pre-filter and the AI scoring step.
+                "description": "",
+                "date_posted": j.get("datumErsteVeroeffentlichung", ""),
+                "site":        "arbeitsagentur",
+            })
+        log(f"  ✓ Arbeitsagentur: {len(rows)} jobs for '{term}'  ({int(time.time()-t0)}s)")
+        return pd.DataFrame(rows)
+    except Exception as e:
+        log(f"  ✗ Arbeitsagentur error: {e}")
+        return pd.DataFrame()
+
+
+def scrape_jooble(term):
+    """Jooble aggregator API. Free tier: 500 requests TOTAL, lifetime — see
+    JOOBLE_SEARCH_TERMS above for why this only runs a handful of terms."""
+    if not JOOBLE_API_KEY:
+        return pd.DataFrame()
+    t0 = time.time()
+    try:
+        r = requests.post(
+            f"https://jooble.org/api/{JOOBLE_API_KEY}",
+            json={"keywords": term, "location": "Germany", "ResultOnPage": 50},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log(f"  ✗ Jooble HTTP {r.status_code} for '{term}'")
+            return pd.DataFrame()
+
+        rows = []
+        for j in r.json().get("jobs", []):
+            if not is_recent(j.get("updated", "")):
+                continue
+            rows.append({
+                "title":       j.get("title", ""),
+                "company":     j.get("company", ""),
+                "location":    j.get("location", "Germany"),
+                "job_url":     j.get("link", ""),
+                "description": j.get("snippet", ""),
+                "date_posted": j.get("updated", ""),
+                "site":        "jooble",
+            })
+        log(f"  ✓ Jooble: {len(rows)} jobs for '{term}'  ({int(time.time()-t0)}s)")
+        return pd.DataFrame(rows)
+    except Exception as e:
+        log(f"  ✗ Jooble error: {e}")
+        return pd.DataFrame()
+
+
 # ── Pipeline ─────────────────────────────────────────────────
 
 def process_term(term):
     log(f"\n[Scraping: '{term}']")
     results = [scrape_jobspy_sites(term)]
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(api, term) for api in [scrape_adzuna, scrape_arbeitnow]]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [
+            pool.submit(api, term)
+            for api in [scrape_adzuna, scrape_arbeitnow, scrape_arbeitsagentur]
+        ]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -182,6 +356,7 @@ def main():
     start = time.time()
     log(f"⏱ Cutoff: {CUTOFF.strftime('%Y-%m-%d %H:%M UTC')} ({HOURS_WINDOW}h window)")
     log(f"⏱ Adzuna keys: {'✓ set' if (ADZUNA_APP_ID and ADZUNA_APP_KEY) else '✗ missing'}")
+    log(f"⏱ Jooble key:  {'✓ set' if JOOBLE_API_KEY else '✗ missing'}")
 
     all_jobs = []
     for i, term in enumerate(SEARCH_TERMS):
@@ -190,10 +365,32 @@ def main():
             log("  ⏳ Cooling down 10s before next term...")
             time.sleep(10)   # reduced from 15s
 
+    if JOOBLE_API_KEY:
+        log(f"\n[Scraping Jooble — {len(JOOBLE_SEARCH_TERMS)} broad terms only, see JOOBLE_SEARCH_TERMS comment]")
+        for term in JOOBLE_SEARCH_TERMS:
+            all_jobs.append(scrape_jooble(term))
+            time.sleep(2)
+
     combined = pd.concat(all_jobs, ignore_index=True)
     combined = combined[combined["title"].notna() & (combined["title"] != "")]
     combined["company"] = combined["company"].fillna("").astype(str)
-    combined.drop_duplicates(subset=["title", "company"], keep="first", inplace=True)
+
+    # Cross-source dedup on normalized title+company — catches the same job
+    # posted to multiple sources under different formatting (see helpers
+    # above). Rows with no company (rare — mainly Arbeitsagentur edge cases)
+    # skip this pass and fall through to the job_url dedup below instead,
+    # so two different blank-company jobs with the same title don't collide.
+    combined["_title_key"]   = combined["title"].apply(normalize_key)
+    combined["_company_key"] = combined["company"].apply(normalize_company)
+    has_company = combined["_company_key"] != ""
+    before = len(combined)
+    combined = pd.concat([
+        combined[has_company].drop_duplicates(subset=["_title_key", "_company_key"], keep="first"),
+        combined[~has_company],
+    ], ignore_index=True)
+    log(f"  → Cross-source dedup (normalized title+company): {before} → {len(combined)}")
+    combined.drop(columns=["_title_key", "_company_key"], inplace=True)
+
     if "job_url" in combined.columns:
         combined = combined[combined["job_url"].notna() & (combined["job_url"] != "")]
         combined.drop_duplicates(subset=["job_url"], keep="first", inplace=True)

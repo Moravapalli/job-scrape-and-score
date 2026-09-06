@@ -30,11 +30,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore scoring cache (dedupe + daily token budget)
+        uses: actions/cache@v4
+        with:
+          path: cache/
+          key: scoring-cache-${{ github.run_id }}
+          restore-keys: |
+            scoring-cache-
+
       - name: Stage 1 — Scrape jobs
         run: python scraper.py
         env:
           ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
 
       - name: Stage 2 — Score with Groq
         run: python scorer.py

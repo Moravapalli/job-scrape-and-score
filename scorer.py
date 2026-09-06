@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os, json, time, re, pandas as pd
+from datetime import date
 from groq import Groq
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -32,20 +33,31 @@ ENABLE_PREFILTER   = True      # quick keyword check before API call
 # target roles/resume.
 TITLE_INCLUDE_KEYWORDS = [
     "ai", "artificial intelligence", "machine learning", "ml engineer",
-    "deep learning", "computer vision", "cv engineer", "mlops",
+    "ml systems", "deep learning", "computer vision", "cv engineer",
+    "machine vision", "vision engineer", "embedded vision", "mlops",
     "data scientist", "data engineer", "nlp", "llm", "generative ai",
-    "perception", "robotics", "autonomous", "embedded vision",
-    "applied scientist", "research scientist", "vision engineer",
+    "perception", "robotics", "autonomous", "inference engineer",
+    "ai software engineer", "applied scientist", "research scientist",
+    "research engineer",
 ]
 
 TITLE_EXCLUDE_KEYWORDS = [
     "sales", "account executive", "account manager", "business development",
-    "marketing", "recruiter", "talent acquisition", "human resources",
-    "finance manager", "accountant", "bookkeeper", "legal counsel",
+    "marketing", "recruiter", "recruiting", "talent acquisition",
+    "human resources", "finance", "accountant", "bookkeeper", "legal",
     "procurement", "warehouse", "logistics", "customer success",
-    "community manager", "social media", "content creator", "copywriter",
+    "community manager", "social media", "content", "copywriter",
     "video editor", "chief of staff", "general manager", "operations manager",
     "presenter", "host", "onboarding manager", "billing manager",
+]
+
+# Unambiguous hard-reject language phrases — same "cap at 3" rule the system
+# prompt already applies, but caught here for free (no API call) instead of
+# spending tokens to have the LLM re-derive the same verdict.
+HARD_REJECT_LANGUAGE = [
+    "muttersprachlich", "muttersprachliche", "native german speaker",
+    "c2 deutsch", "c2-niveau deutsch", "verhandlungssicheres deutsch",
+    "verhandlungssicher deutsch", "verhandlungssichere deutschkenntnisse",
 ]
 
 # ── Load resume — env var (CI) or file (local) ────────────────────────
@@ -120,8 +132,15 @@ Return ONLY this JSON — nothing else:
   "apply": <true if score >= 7, else false>
 }}"""
 
+class DailyQuotaExhausted(Exception):
+    """Raised when Groq reports the daily token quota (TPD) is exhausted —
+    unlike a per-minute rate limit, retrying within seconds/minutes can't
+    fix this, so the caller should stop the whole run rather than retry."""
+
+
 # ── Scorer with smart 429 handling ────────────────────────────────────
 def score_job(row, retries=4):
+    """Returns (result_dict, tokens_used_this_call)."""
     for attempt in range(retries):
         try:
             response = client.chat.completions.create(
@@ -148,6 +167,7 @@ def score_job(row, retries=4):
             raw   = raw[start:end]
 
             result = json.loads(raw)
+            tokens = response.usage.total_tokens if response.usage else 0
             return {
                 "score":           result.get("score", 0),
                 "skills_match":    result.get("skills_match", 0),
@@ -156,7 +176,7 @@ def score_job(row, retries=4):
                 "concerns":        " | ".join(result.get("concerns", [])),
                 "reason":          result.get("reason", ""),
                 "apply":           result.get("apply", False),
-            }
+            }, tokens
 
         except json.JSONDecodeError:
             print(f"  ✗ Bad JSON (attempt {attempt+1}) — retrying...", flush=True)
@@ -164,6 +184,9 @@ def score_job(row, retries=4):
 
         except Exception as e:
             error_msg = str(e)
+            if "tokens per day" in error_msg.lower() or "(tpd)" in error_msg.lower():
+                # Daily cap — a 25s/1m retry can't help, don't waste more calls.
+                raise DailyQuotaExhausted(error_msg)
             if "429" in error_msg or "rate_limit" in error_msg.lower():
                 match = re.search(r"try again in ([\d.]+)s", error_msg)
                 wait  = float(match.group(1)) + 2 if match else 25
@@ -173,7 +196,7 @@ def score_job(row, retries=4):
                 print(f"  ✗ Error: {error_msg[:120]}", flush=True)
                 time.sleep(5)
 
-    return _empty_score()
+    return _empty_score(), 0
 
 
 def _empty_score():
@@ -181,6 +204,14 @@ def _empty_score():
         "score": 0, "skills_match": 0, "seniority_match": 0,
         "highlights": "", "concerns": "scoring failed",
         "reason": "Could not score this listing", "apply": False,
+    }
+
+
+def _unscored_quota():
+    return {
+        "score": None, "skills_match": None, "seniority_match": None,
+        "highlights": "", "concerns": "not scored — daily token quota reached, will retry next run",
+        "reason": "", "apply": False,
     }
 
 
@@ -192,6 +223,57 @@ def quick_filter(row):
     if any(kw in title for kw in TITLE_EXCLUDE_KEYWORDS):
         return False
     return any(kw in title for kw in TITLE_INCLUDE_KEYWORDS)
+
+
+def language_hard_reject(row):
+    """Catches the same 'cap at 3' verdict the system prompt would reach for
+    unambiguous native/C2/verhandlungssicher German requirements — but for
+    free, without spending an API call to have the LLM re-derive it."""
+    text = (str(row.get("title", "")) + " " + str(row.get("description", ""))).lower()
+    return any(kw in text for kw in HARD_REJECT_LANGUAGE)
+
+
+def _hard_reject_score():
+    return {
+        "score": 3, "skills_match": 0, "seniority_match": 0,
+        "highlights": "",
+        "concerns": "Requires native/C2/verhandlungssicher German — exceeds candidate's B1 level",
+        "reason": "Language requirement (native/C2/business-fluent German) rules this out regardless of skills fit.",
+        "apply": False,
+    }
+
+
+# ── Persistent cache + daily token budget ───────────────────────────────
+# Lives in cache/ (not output/), which persists across GitHub Actions runs
+# via actions/cache in pipeline.yml — output/ is per-run artifact only.
+CACHE_DIR          = "cache"
+SCORED_CACHE_PATH  = os.path.join(CACHE_DIR, "scored_cache.json")
+TOKEN_USAGE_PATH   = os.path.join(CACHE_DIR, "token_usage.json")
+DAILY_TOKEN_BUDGET  = 190_000   # stay under Groq's 200K TPD free-tier cap, with margin
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def load_json(path):
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_token_usage():
+    state = load_json(TOKEN_USAGE_PATH)
+    today = str(date.today())
+    if state.get("date") != today:
+        return {"date": today, "tokens_used": 0}
+    return state
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -223,6 +305,16 @@ if total == 0:
     print("✗ No jobs to score after filtering")
     exit(0)
 
+scored_cache = load_json(SCORED_CACHE_PATH)
+token_state  = load_token_usage()
+tokens_used  = token_state["tokens_used"]
+
+cache_hits    = 0
+hard_rejects  = 0
+quota_skipped = 0
+api_calls     = 0
+
+print(f"  → Token budget today: {tokens_used:,} / {DAILY_TOKEN_BUDGET:,} used", flush=True)
 print(f"Scoring {total} jobs with Groq ({MODEL})...\n", flush=True)
 
 results    = []
@@ -231,9 +323,49 @@ start_time = time.time()
 for i, row in jobs.iterrows():
     title   = str(row.get("title",   "?"))[:50]
     company = str(row.get("company", "?"))[:30]
+    job_url = str(row.get("job_url", "") or "")
     print(f"[{i+1}/{total}] {title} @ {company}", end=" ... ", flush=True)
 
-    result = score_job(row)
+    if job_url and job_url in scored_cache:
+        result = scored_cache[job_url]
+        cache_hits += 1
+        results.append(result)
+        print(f"score: {result['score']}/10 (cached)", flush=True)
+        continue
+
+    if language_hard_reject(row):
+        result = _hard_reject_score()
+        hard_rejects += 1
+        results.append(result)
+        if job_url:
+            scored_cache[job_url] = result
+            save_json(SCORED_CACHE_PATH, scored_cache)
+        print(f"score: {result['score']}/10 (language hard-reject, no API call)", flush=True)
+        continue
+
+    if tokens_used >= DAILY_TOKEN_BUDGET:
+        quota_skipped += 1
+        results.append(_unscored_quota())
+        print("skipped — daily token budget reached", flush=True)
+        continue
+
+    try:
+        result, tokens = score_job(row)
+    except DailyQuotaExhausted:
+        remaining = total - i
+        quota_skipped += remaining
+        results.extend(_unscored_quota() for _ in range(remaining))
+        print(f"\n  ⚠ Daily token quota hit — stopping. {remaining} remaining job(s) will be retried next run.", flush=True)
+        break
+
+    tokens_used += tokens
+    api_calls += 1
+    token_state["tokens_used"] = tokens_used
+    save_json(TOKEN_USAGE_PATH, token_state)
+    if job_url:
+        scored_cache[job_url] = result
+        save_json(SCORED_CACHE_PATH, scored_cache)
+
     results.append(result)
     print(f"score: {result['score']}/10", flush=True)
     time.sleep(SLEEP_BETWEEN_CALLS)
@@ -253,6 +385,8 @@ print(f"""
   Groq scoring complete ({mins}m {secs}s)
   Model:          {MODEL}
   Pre-filtered:   {total_raw} → {total}
+  API calls:      {api_calls}  (cached: {cache_hits}, hard-reject: {hard_rejects}, quota-skipped: {quota_skipped})
+  Tokens today:   {tokens_used:,} / {DAILY_TOKEN_BUDGET:,}
   Shortlisted:    {len(shortlist)}  (score >= {MIN_SCORE})
   Cost:           $0.00
 ╚══════════════════════════════════╝
